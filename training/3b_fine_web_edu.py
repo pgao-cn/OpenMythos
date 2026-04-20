@@ -236,10 +236,12 @@ def main():
                 else model.no_sync()
             )
             with sync, amp_ctx:
-                logits = model(x)
+                logits, balance_loss = model(x)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
                 )
+                if balance_loss is not None:
+                    loss = loss + balance_loss
                 loss = loss / grad_accum
 
             loss.backward()

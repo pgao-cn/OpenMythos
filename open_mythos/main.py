@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -72,6 +72,26 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # Expert balance loss weight (0.0 = disabled, e.g. when using bias routing)
+    moe_balance_alpha: float = 0.001
+
+    def __post_init__(self) -> None:
+        if self.dim % self.n_heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
+            )
+        if self.max_loop_iters <= 0:
+            raise ValueError(f"max_loop_iters must be positive, got {self.max_loop_iters}")
+        if not (0 < self.act_threshold <= 1.0):
+            raise ValueError(f"act_threshold must be in (0, 1], got {self.act_threshold}")
+        if self.n_experts_per_tok > self.n_experts:
+            raise ValueError(
+                f"n_experts_per_tok ({self.n_experts_per_tok}) must be <= n_experts ({self.n_experts})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +460,13 @@ class MoEFFN(nn.Module):
         """
         Args:
             cfg -- MythosConfig; uses n_experts, n_shared_experts, n_experts_per_tok,
-                   dim, expert_dim
+                   dim, expert_dim, moe_balance_alpha
         """
         super().__init__()
         self.n_experts = cfg.n_experts
         self.n_shared = cfg.n_shared_experts
         self.topk = cfg.n_experts_per_tok
+        self.balance_alpha = cfg.moe_balance_alpha
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
         # load-balancing bias adjusted externally during training; not a gradient param
@@ -461,39 +482,56 @@ class MoEFFN(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             x -- input of shape (B, T, dim)
         Returns:
-            Tensor of shape (B, T, dim); shared expert outputs are summed on top
-            of the weighted routed expert outputs
+            Tuple of:
+              - output tensor of shape (B, T, dim)
+              - balance_loss scalar (or None when moe_balance_alpha == 0 or not training)
         """
         B, T, D = x.shape
         flat = x.view(B * T, D)
+        N = B * T
 
         # router — bias shifts logits for load balancing without touching loss
-        logits = self.router(flat) + self.router_bias  # (B*T, n_experts)
-        scores = F.softmax(logits, dim=-1)
-        topk_scores, topk_idx = scores.topk(self.topk, dim=-1)
+        logits = self.router(flat) + self.router_bias  # (N, n_experts)
+        scores = F.softmax(logits, dim=-1)             # (N, n_experts)
+        topk_scores, topk_idx = scores.topk(self.topk, dim=-1)  # (N, topk)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
-        out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        # balance loss (DeepSeekMoE §3.3): L = alpha * sum_i(f_i * P_i)
+        balance_loss: Optional[torch.Tensor] = None
+        if self.training and self.balance_alpha > 0.0:
+            # f_i: fraction of tokens routed to expert i
+            tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
+            tokens_per_expert.scatter_add_(
+                0, topk_idx.reshape(-1), torch.ones(N * self.topk, device=x.device)
+            )
+            f = tokens_per_expert / (N * self.topk)
+            # P_i: mean soft gate score for expert i
+            P = scores.mean(dim=0)
+            balance_loss = self.balance_alpha * (f * P).sum()
+
+        # vectorized routed expert dispatch via scatter
+        # expert_outputs: (n_experts, N, D) — only compute needed experts
+        out = torch.zeros(N, D, device=x.device, dtype=x.dtype)
+        for eid in range(self.n_experts):
+            # mask: (N,) tokens whose topk includes this expert
+            expert_mask = (topk_idx == eid).any(dim=-1)  # (N,)
+            if not expert_mask.any():
+                continue
+            # which topk slot matched for weight lookup
+            slot = (topk_idx[expert_mask] == eid).float().argmax(dim=-1)
+            weights = topk_scores[expert_mask][torch.arange(expert_mask.sum()), slot]
+            out[expert_mask] += weights.unsqueeze(-1) * self.routed_experts[eid](flat[expert_mask])
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
             out = out + shared(flat)
 
-        return out.view(B, T, D)
+        return out.view(B, T, D), balance_loss
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +653,7 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             x         -- input of shape (B, T, dim)
@@ -625,13 +663,19 @@ class TransformerBlock(nn.Module):
             cache_key -- key identifying this layer in the cache
 
         Returns:
-            Output tensor of shape (B, T, dim)
+            Tuple of:
+              - output tensor of shape (B, T, dim)
+              - balance_loss scalar from MoEFFN (None for dense FFN blocks)
         """
         x = x + self.resid_drop(
             self.attn(self.attn_norm(x), freqs_cis, mask, kv_cache, cache_key)
         )
-        x = x + self.resid_drop(self.ffn(self.ffn_norm(x)))
-        return x
+        if isinstance(self.ffn, MoEFFN):
+            ffn_out, balance_loss = self.ffn(self.ffn_norm(x))
+        else:
+            ffn_out, balance_loss = self.ffn(self.ffn_norm(x)), None
+        x = x + self.resid_drop(ffn_out)
+        return x, balance_loss
 
 
 # ---------------------------------------------------------------------------
@@ -803,7 +847,9 @@ class RecurrentBlock(nn.Module):
                         each loop iteration uses a separate cache key
 
         Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            Tuple of:
+              - ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+              - total balance_loss scalar summed over all loop iterations (or None)
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
@@ -811,12 +857,15 @@ class RecurrentBlock(nn.Module):
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
+        total_balance_loss: Optional[torch.Tensor] = None
 
         for t in range(n_loops):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            trans_out, balance_loss = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            if balance_loss is not None:
+                total_balance_loss = balance_loss if total_balance_loss is None else total_balance_loss + balance_loss
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
@@ -831,7 +880,8 @@ class RecurrentBlock(nn.Module):
                 remainder,
                 p,
             )
-            h_out = h_out + weight.unsqueeze(-1) * h
+            # Only accumulate h_out for positions that have not yet halted
+            h_out = h_out + weight.unsqueeze(-1) * h * still_running.unsqueeze(-1).float()
 
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
@@ -839,7 +889,7 @@ class RecurrentBlock(nn.Module):
             if halted.all():
                 break
 
-        return h_out
+        return h_out, total_balance_loss
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +986,8 @@ class OpenMythos(nn.Module):
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
-    ) -> torch.Tensor:
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
 
@@ -946,9 +997,13 @@ class OpenMythos(nn.Module):
                          Increase at inference to extrapolate to harder problems.
             kv_cache  -- dict mutated in-place for autoregressive KV caching;
                          pass an empty dict {} and reuse across decode steps
+            start_pos -- starting position in the sequence (used for KV-cache decoding
+                         to select correct RoPE frequencies; 0 for prefill, prompt_len+i for decode)
 
         Returns:
-            Logits of shape (B, T, vocab_size)
+            Tuple of:
+              - Logits of shape (B, T, vocab_size)
+              - balance_loss scalar from the recurrent MoE block (None at inference or when disabled)
         """
         B, T = input_ids.shape
         device = input_ids.device
@@ -956,19 +1011,19 @@ class OpenMythos(nn.Module):
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
-        )[:T]
+        )[start_pos : start_pos + T]
         mask = self._causal_mask(T, device) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
-            x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
+            x, _ = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        x, balance_loss = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
 
         for i, layer in enumerate(self.coda):
-            x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
+            x, _ = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
-        return self.head(self.norm(x))
+        return self.head(self.norm(x)), balance_loss
 
     @torch.no_grad()
     def generate(
@@ -1001,9 +1056,15 @@ class OpenMythos(nn.Module):
             Token indices of shape (B, T + max_new_tokens)
         """
         kv_cache: dict = {}
+        prompt_len = input_ids.shape[1]
         for step in range(max_new_tokens):
-            cur_ids = input_ids if step == 0 else input_ids[:, -1:]
-            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
+            if step == 0:
+                cur_ids = input_ids
+                start_pos = 0
+            else:
+                cur_ids = input_ids[:, -1:]
+                start_pos = prompt_len + step - 1
+            logits, _ = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)
